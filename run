@@ -1,0 +1,160 @@
+#!/bin/bash
+
+DEBIAN_FRONTEND="noninteractive"
+MACHINE_NAME="$(cat /etc/hostname)"
+WORKING_DIR="/$(realpath --relative-to=/ $(dirname $0))"
+RESOURSE_DIR="$WORKING_DIR/Resources"
+[ ! -d $RESOURSE_DIR ] && mkdir -pv $RESOURSE_DIR
+
+### ENABLE SECUREBOOT BEGIN
+BIOS_DIR=$RESOURSE_DIR/bios
+[ -d $BIOS_DIR ] || mkdir -pv $BIOS_DIR
+OVMF_VARS_ORIG="/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+OVMF_VARS="$BIOS_DIR/$(basename $OVMF_VARS_ORIG)"
+[ -f "$OVMF_VARS" ] || ovmf=y
+if [ "$ovmf" = "y" ]; then
+  [ -e "$OVMF_VARS" ] || cp -rfv "$OVMF_VARS_ORIG" "$OVMF_VARS" || exit $?
+fi
+### ENABLE SECUREBOOT END
+
+CD_ROOM="/media/xxx/sdc2/xxx/Downloads/ISO/debian-live-13.0.0-amd64-gnome.iso"
+MAC_ADDR=$(printf '52:54:00:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+IF_NAME=qemu_tap_0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --ifname)
+  		IF_NAME="$2"
+        [ -z "$IF_NAME" ] && echo "Usage: $(basename $0) --ifname <qemu_tap_0>" && exit 1
+      shift 2
+      ;;
+
+    --ifname=*)
+        IF_NAME="${1#*=}"
+        [ -z "$IF_NAME" ] && echo "Usage: $(basename $0) --ifname <qemu_tap_0>" && exit 1
+        shift
+        ;;
+    *)
+      echo "Usage: $(basename $0) --ifname <qemu_tap_0>"
+      exit 127
+      ;;
+  esac
+done
+
+if [ ! -d "/sys/class/net/$IF_NAME" ]; then
+  echo "⚠️  Network interface '$IF_NAME' does not exist."
+  echo
+  echo "👉 What you can do:"
+  echo "   - Make sure the interface name is correct"
+  echo "   - Run the following command to create it:"
+  echo
+  echo "     setup --qemu-tap $IF_NAME && run --ifname $IFNAME"
+  echo
+  exit 1
+fi
+
+args=(
+  -name "${MACHINE_NAME}_${MAC_ADDR}"
+  -machine q35,smm=on,kernel-irqchip=split -device intel-iommu,intremap=on
+
+  ### CPU BEGIN
+  -cpu host,kvm=on
+  -enable-kvm
+  # -smp cores=1,threads=1,sockets=1
+  -smp $(nproc)
+  ### CPU END
+
+  ### MEMORY BEGIN
+  -m $((1024 * 6))
+  # -mem-path /dev/shm
+  ### MEMORY BEGIN
+
+  ### BIOS BEGIN
+  -object rng-random,filename=/dev/urandom,id=rng0
+  -device virtio-rng-pci,rng=rng0
+  -global driver=cfi.pflash01,property=secure,value=on
+  -drive if=pflash,format=raw,unit=0,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd,readonly=on
+  -drive if=pflash,format=raw,unit=1,file="$OVMF_VARS"
+  -boot order=c,menu=on ## F2 ENTER TO BIOS
+  ### BIOS END
+
+  ### TMP BEGIN
+  $(_DIR_TPM=/tmp/mytpm0; mkdir -p $_DIR_TPM && swtpm socket --tpm2 --ctrl type=unixio,path=$_DIR_TPM/swtpm-sock --tpmstate dir=$_DIR_TPM --log level=20 --daemon)
+  -chardev socket,id=chrtpm,path=/tmp/mytpm0/swtpm-sock
+  -tpmdev emulator,id=tpm0,chardev=chrtpm
+  -device tpm-tis,tpmdev=tpm0
+  ### TMP END
+
+  ### NETWORK BEGIND
+  ## BRIDGE BEGIN
+  -netdev tap,id=net_0,ifname=$IF_NAME,script=no,downscript=no
+  -device virtio-net-pci,netdev=net_0,mac=$MAC_ADDR
+  ## BRIDGE END
+  ### NETWORK END
+
+  ### CDROM BEGIN
+  $([ -f "$CD_ROOM" ] && echo "-cdrom ${CD_ROOM}")
+  ### CDROM END
+
+  ### DISK BEGIN
+  ## IMG FILE
+  $([ -f "$RESOURSE_DIR/disks/disk_0.img" ] && echo "-drive file=$RESOURSE_DIR/disks/disk_0.img,format=raw")
+  # -drive file=/dev/md0,format=raw
+  ### DISK END
+
+  ### USB_HOST BEGIN
+  ## REQUIRED ROOT
+  ## dmesg: idVendor=04f2, idProduct=b2fb
+  ## lsusb: Bus 001 Device 005: ID 04f2:b2fb
+  #-device qemu-xhci
+  #-device usb-host,vendorid=0x058f,productid=0x6366 # Alcor Micro Corp. Multi Flash Reader
+  #-device usb-host,vendorid=0x04f2,productid=0xb2fb # Chicony Electronics Co., Ltd Integrated Camera
+  #-device usb-host,vendorid=0x147e,productid=0x1002 # Upek Biometric Touchchip/Touchstrip Fingerprint Sensor
+  #-device usb-host,vendorid=0x14cd,productid=0x1212 # Super Top microSD card reader (SY-T18)
+  ### USB_HOST END
+
+  ### AUDIO BEGIN
+  ## ICH9 BEGIN
+  # -device ich9-intel-hda -device hda-duplex ### REQUIRED WIREPLUMBER
+  ## ICH9 END
+  ## ICH6 BEGIN
+  # -device intel-hda -device hda-duplex
+  ## ICH6 END
+  ## STREAM BEGIN
+  # -audiodev pa,id=pa,server=unix:${XDG_RUNTIME_DIR}/pulse/native,out.stream-name=foobar,in.stream-name=foobar
+  # -device intel-hda
+  # -device hda-duplex,audiodev=pa,mixer=off
+  ## STREAM END
+  ### AUDIO END
+
+  ### VFIO_PCI BEGIN
+  ## modprobe -v vfio-pci ids=8086:1e31,8086:1e26,8086:1e2d,8086:1e20
+  #-device vfio-pci,host=00:14.0 # USB controller [0c03]: Intel Corporation 7 Series/C210 Series Chipset Family USB xHCI Host Controller [8086:1e31] (rev 04)
+  #-device vfio-pci,host=00:1d.0 # USB controller [0c03]: Intel Corporation 7 Series/C216 Chipset Family USB Enhanced Host Controller #1 [8086:1e26] (rev 04)
+  #-device vfio-pci,host=00:1a.0 # USB controller [0c03]: Intel Corporation 7 Series/C216 Chipset Family USB Enhanced Host Controller #2 [8086:1e2d] (rev 04)
+  #-device vfio-pci,host=00:1b.0 # Audio device 	[0403]: Intel Corporation 7 Series/C216 Chipset Family High Definition Audio Controller [8086:1e20] (rev 04)
+  ### VFIO_PCI END
+
+  ### VGA BEGIN
+	-device virtio-vga-gl
+  ## FOR LINUX
+  -display gtk,gl=on
+  ## FOR WINDOWS
+  # -display sdl,gl=on
+  ### VGA END
+
+  ### KERNEL BEGIN
+  #-kernel /boot/vmlinuz-$(uname -r)
+  #-initrd /boot/initrd.img-$(uname -r)
+  #-append "root=/dev/sda fsck.mode=skip"
+  ### KERNEL END
+
+  # -kernel /media/xxx/sdc2/xxx/Kernel/Sources/xanmod/linux-6.14.4-qemu/arch/x86/boot/bzImage
+  # -append "quiet intel_iommu=igfx_off systemd.gpt_auto=0 modprobe.blacklist=snd_hda_intel,xhci_pci,ehci_pci,kvm_intel,ipv6,uas,bcma,r8169,uvcvideo,psmouse"
+
+  # AUTODETECT RAID 0.90
+  # -append "md=0,/dev/sda2,/dev/sda1 root=/dev/md0 init=/init quiet intel_iommu=igfx_off systemd.gpt_auto=0 modprobe.blacklist=snd_hda_intel,xhci_pci,ehci_pci,kvm_intel,ipv6,uas,bcma,r8169,uvcvideo,psmouse"
+
+  -monitor mon:stdio
+
+)
+qemu-system-x86_64 "${args[@]}"
